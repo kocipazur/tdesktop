@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_file_utilities.h"
 #include "base/platform/base_platform_info.h"
 #include "base/platform/linux/base_linux_glibmm_helper.h"
+#include "platform/linux/linux_wayland_integration.h"
 #include "storage/localstorage.h"
 #include "base/openssl_help.h"
 #include "base/qt_adapters.h"
@@ -19,6 +20,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <glibmm.h>
 #include <giomm.h>
+
+using Platform::internal::WaylandIntegration;
 
 namespace Platform {
 namespace FileDialog {
@@ -128,7 +131,7 @@ void ComputeFileChooserPortalVersion() {
 //
 // XDP file dialog is a dialog obtained via a DBus service
 // provided by the current desktop environment.
-class XDPFileDialog : public QDialog, public sigc::trackable {
+class XDPFileDialog : public QDialog {
 public:
 	enum ConditionType : uint {
 		GlobalPattern = 0,
@@ -191,12 +194,8 @@ public:
 private:
 	void openPortal();
 	void gotResponse(
-		const Glib::RefPtr<Gio::DBus::Connection> &connection,
-		const Glib::ustring &sender_name,
-		const Glib::ustring &object_path,
-		const Glib::ustring &interface_name,
-		const Glib::ustring &signal_name,
-		const Glib::VariantContainerBase &parameters);
+		uint response,
+		const std::map<Glib::ustring, Glib::VariantBase> &results);
 
 	void showHelper(
 		Qt::WindowFlags windowFlags,
@@ -208,11 +207,10 @@ private:
 	rpl::producer<> rejected();
 
 	Glib::RefPtr<Gio::DBus::Connection> _dbusConnection;
-	Glib::RefPtr<Gio::Cancellable> _cancellable;
 	uint _requestSignalId = 0;
 
 	// Options
-	WId _winId = 0;
+	QWindow *_parent = nullptr;
 	QFileDialog::Options _options;
 	QFileDialog::AcceptMode _acceptMode = QFileDialog::AcceptOpen;
 	QFileDialog::FileMode _fileMode = QFileDialog::ExistingFile;
@@ -263,10 +261,6 @@ XDPFileDialog::XDPFileDialog(
 }
 
 XDPFileDialog::~XDPFileDialog() {
-	if (_cancellable) {
-		_cancellable->cancel();
-	}
-
 	if (_dbusConnection && _requestSignalId != 0) {
 		_dbusConnection->signal_unsubscribe(_requestSignalId);
 	}
@@ -275,8 +269,13 @@ XDPFileDialog::~XDPFileDialog() {
 void XDPFileDialog::openPortal() {
 	std::stringstream parentWindowId;
 
-	if (IsX11()) {
-		parentWindowId << "x11:" << std::hex << _winId;
+	if (const auto integration = WaylandIntegration::Instance()) {
+		if (const auto handle = integration->nativeHandle(_parent)
+			; !handle.isEmpty()) {
+			parentWindowId << "wayland:" << handle.toStdString();
+		}
+	} else if (IsX11() && _parent) {
+		parentWindowId << "x11:" << std::hex << _parent->winId();
 	}
 
 	std::map<Glib::ustring, Glib::VariantBase> options;
@@ -418,15 +417,40 @@ void XDPFileDialog::openPortal() {
 			+ '/'
 			+ handleToken;
 
+		const auto responseCallback = crl::guard(this, [=](
+			const Glib::RefPtr<Gio::DBus::Connection> &connection,
+			const Glib::ustring &sender_name,
+			const Glib::ustring &object_path,
+			const Glib::ustring &interface_name,
+			const Glib::ustring &signal_name,
+			const Glib::VariantContainerBase &parameters) {
+			try {
+				auto parametersCopy = parameters;
+
+				const auto response = base::Platform::GlibVariantCast<uint>(
+					parametersCopy.get_child(0));
+
+				const auto results = base::Platform::GlibVariantCast<
+					std::map<
+						Glib::ustring,
+						Glib::VariantBase
+					>>(parametersCopy.get_child(1));
+
+				gotResponse(response, results);
+			} catch (const std::exception &e) {
+				LOG(("XDP File Dialog Error: %1").arg(
+					QString::fromStdString(e.what())));
+
+				_reject.fire({});
+			}
+		});
+
 		_requestSignalId = _dbusConnection->signal_subscribe(
-			sigc::mem_fun(this, &XDPFileDialog::gotResponse),
+			responseCallback,
 			{},
 			"org.freedesktop.portal.Request",
 			"Response",
 			requestPath);
-
-		// synchronize functor deletion by this cancellable
-		_cancellable = Gio::Cancellable::create();
 
 		_dbusConnection->call(
 			std::string(kXDGDesktopPortalObjectPath),
@@ -439,7 +463,7 @@ void XDPFileDialog::openPortal() {
 				_windowTitle,
 				options,
 			}),
-			[=](const Glib::RefPtr<Gio::AsyncResult> &result) {
+			crl::guard(this, [=](const Glib::RefPtr<Gio::AsyncResult> &result) {
 				try {
 					auto reply = _dbusConnection->call_finish(result);
 
@@ -447,10 +471,15 @@ void XDPFileDialog::openPortal() {
 						Glib::ustring>(reply.get_child(0));
 
 					if (handle != requestPath) {
-						crl::on_main([=] {
-							_failedToOpen = true;
-							_reject.fire({});
-						});
+						_dbusConnection->signal_unsubscribe(
+							_requestSignalId);
+
+						_requestSignalId = _dbusConnection->signal_subscribe(
+							responseCallback,
+							{},
+							"org.freedesktop.portal.Request",
+							"Response",
+							handle);
 					}
 				} catch (const Glib::Error &e) {
 					static const auto NotSupportedErrors = {
@@ -478,8 +507,7 @@ void XDPFileDialog::openPortal() {
 						_reject.fire({});
 					});
 				}
-			},
-			_cancellable,
+			}),
 			std::string(kXDGDesktopPortalService));
 	} catch (...) {
 		_failedToOpen = true;
@@ -609,30 +637,15 @@ void XDPFileDialog::showHelper(
 		Qt::WindowModality windowModality,
 		QWindow *parent) {
 	_modal = windowModality != Qt::NonModal;
-	_winId = parent ? parent->winId() : 0;
+	_parent = parent;
 
 	openPortal();
 }
 
 void XDPFileDialog::gotResponse(
-		const Glib::RefPtr<Gio::DBus::Connection> &connection,
-		const Glib::ustring &sender_name,
-		const Glib::ustring &object_path,
-		const Glib::ustring &interface_name,
-		const Glib::ustring &signal_name,
-		const Glib::VariantContainerBase &parameters) {
+		uint response,
+		const std::map<Glib::ustring, Glib::VariantBase> &results) {
 	try {
-		auto parametersCopy = parameters;
-
-		const auto response = base::Platform::GlibVariantCast<uint>(
-			parametersCopy.get_child(0));
-
-		const auto results = base::Platform::GlibVariantCast<
-			std::map<
-				Glib::ustring,
-				Glib::VariantBase
-			>>(parametersCopy.get_child(1));
-
 		if (!response) {
 			if (const auto i = results.find("uris"); i != end(results)) {
 				_selectedFiles = base::Platform::GlibVariantCast<
